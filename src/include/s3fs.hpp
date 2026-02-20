@@ -185,6 +185,10 @@ protected:
 	atomic<uint16_t> parts_uploaded;
 	bool upload_finalized = true;
 
+	//! Streaming write support: defer Part 0 upload until header is written
+	bool part_0_deferred = false;
+	bool part_0_written = false;
+
 	//! Error handling in upload threads
 	atomic<bool> uploader_has_error {false};
 	std::exception_ptr upload_exception;
@@ -227,12 +231,13 @@ public:
 	void RemoveFile(const string &filename, optional_ptr<FileOpener> opener = nullptr) override;
 	void RemoveDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override;
 	void FileSync(FileHandle &handle) override;
+	void Truncate(FileHandle &handle, int64_t new_size) override;
 	void Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) override;
 
 	string InitializeMultipartUpload(S3FileHandle &file_handle);
 	void FinalizeMultipartUpload(S3FileHandle &file_handle);
 
-	void FlushAllBuffers(S3FileHandle &handle);
+	void FlushAllBuffers(S3FileHandle &handle, bool include_deferred = true);
 
 	void ReadQueryParams(const string &url_query_param, S3AuthParams &params);
 	static ParsedS3Url S3UrlParse(string url, S3AuthParams &params);
