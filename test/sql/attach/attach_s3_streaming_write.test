@@ -27,12 +27,14 @@ CREATE SECRET (
     SECRET '${AWS_SECRET_ACCESS_KEY}',
     REGION '${AWS_DEFAULT_REGION}',
     ENDPOINT '${DUCKDB_S3_ENDPOINT}',
-    USE_SSL '${DUCKDB_S3_USE_SSL}'
+    USE_SSL '${DUCKDB_S3_USE_SSL}',
+    URL_STYLE 'path'
 )
 
 # ATTACH a new writable DuckDB database on S3 with NO_WAL_WRITES to avoid WAL file writes
+# READ_WRITE is required because remote files default to READ_ONLY access mode
 statement ok
-ATTACH 's3://test-bucket/attach_s3_streaming_write.db' AS s3db (RECOVERY_MODE NO_WAL_WRITES);
+ATTACH 's3://test-bucket/attach_s3_streaming_write.db' AS s3db (RECOVERY_MODE NO_WAL_WRITES, READ_WRITE);
 
 # Create a table and insert data
 statement ok

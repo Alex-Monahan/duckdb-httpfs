@@ -999,17 +999,15 @@ void S3FileSystem::FileSync(FileHandle &handle) {
 		return;
 	}
 
-	if (s3fh.part_0_deferred && !s3fh.part_0_written) {
-		// Sync #1: after data blocks, before header write.
-		// Flush all non-deferred buffers (parts 1..N) but keep Part 0 in memory.
+	if (s3fh.part_0_deferred) {
+		// Streaming write mode: flush all non-deferred buffers (parts 1..N) but keep Part 0 in memory.
+		// Part 0 contains the file header region and will be uploaded last during Close().
+		// This supports DuckDB's checkpoint pattern: data blocks → Sync → header write → Sync → Close.
 		FlushAllBuffers(s3fh, /*include_deferred=*/false);
 	} else {
-		// Sync #2 (or non-deferred path): flush everything including Part 0, then finalize.
-		s3fh.part_0_deferred = false;
+		// Non-streaming path (e.g. COPY TO): flush everything and finalize.
 		FlushAllBuffers(s3fh);
-		if (s3fh.parts_uploaded) {
-			FinalizeMultipartUpload(s3fh);
-		}
+		FinalizeMultipartUpload(s3fh);
 	}
 }
 
