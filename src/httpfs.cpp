@@ -422,7 +422,9 @@ unique_ptr<FileHandle> HTTPFileSystem::OpenFileExtended(const OpenFileInfo &file
 
 	auto handle = CreateHandle(file, flags, opener);
 
-	if (flags.OpenForWriting() && !flags.OpenForAppending() && !flags.OpenForReading()) {
+	if (flags.OpenForWriting() &&
+	    (!flags.OpenForReading() || flags.CreateFileIfNotExists()) &&
+	    (!flags.OpenForAppending() || flags.CreateFileIfNotExists())) {
 		handle->write_overwrite_mode = true;
 	}
 
@@ -876,7 +878,7 @@ void HTTPFileHandle::Initialize(optional_ptr<FileOpener> opener) {
 	auto current_cache = TryGetMetadataCache(opener, hfs);
 
 	bool should_write_cache = false;
-	if (flags.OpenForReading()) {
+	if (flags.OpenForReading() && !write_overwrite_mode) {
 		if (http_params.force_download) {
 			FullDownload(hfs, should_write_cache);
 			return;
@@ -902,7 +904,7 @@ void HTTPFileHandle::Initialize(optional_ptr<FileOpener> opener) {
 	}
 	LoadFileInfo();
 
-	if (flags.OpenForReading()) {
+	if (flags.OpenForReading() && !write_overwrite_mode) {
 		if ((http_params.state && length == 0) || force_full_download) {
 			FullDownload(hfs, should_write_cache);
 		}

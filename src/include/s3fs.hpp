@@ -145,10 +145,8 @@ public:
 	      config_params(config_params_p), uploads_in_progress(0), parts_uploaded(0), upload_finalized(false),
 	      uploader_has_error(false), upload_exception(nullptr) {
 		auto_fallback_to_full_file_download = false;
-		if (flags.OpenForReading() && flags.OpenForWriting()) {
+		if (flags.OpenForReading() && flags.OpenForWriting() && !flags.CreateFileIfNotExists()) {
 			throw NotImplementedException("Cannot open an HTTP file for both reading and writing");
-		} else if (flags.OpenForAppending()) {
-			throw NotImplementedException("Cannot open an HTTP file for appending");
 		}
 	}
 	~S3FileHandle() override;
@@ -184,6 +182,10 @@ protected:
 	//! Info for upload
 	atomic<uint16_t> parts_uploaded;
 	bool upload_finalized = true;
+
+	//! Streaming write support: defer Part 0 upload until header is written
+	bool part_0_deferred = false;
+	bool part_0_written = false;
 
 	//! Error handling in upload threads
 	atomic<bool> uploader_has_error {false};
@@ -227,12 +229,13 @@ public:
 	void RemoveFile(const string &filename, optional_ptr<FileOpener> opener = nullptr) override;
 	void RemoveDirectory(const string &directory, optional_ptr<FileOpener> opener = nullptr) override;
 	void FileSync(FileHandle &handle) override;
+	void Truncate(FileHandle &handle, int64_t new_size) override;
 	void Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) override;
 
 	string InitializeMultipartUpload(S3FileHandle &file_handle);
 	void FinalizeMultipartUpload(S3FileHandle &file_handle);
 
-	void FlushAllBuffers(S3FileHandle &handle);
+	void FlushAllBuffers(S3FileHandle &handle, bool include_deferred = true);
 
 	void ReadQueryParams(const string &url_query_param, S3AuthParams &params);
 	static ParsedS3Url S3UrlParse(string url, S3AuthParams &params);

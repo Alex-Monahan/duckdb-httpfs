@@ -1,0 +1,78 @@
+# name: test/sql/attach/attach_s3_streaming_write.test
+# description: Test writing a DuckDB database file to S3 with streaming multipart upload
+# group: [attach]
+
+require httpfs
+
+require-env S3_TEST_SERVER_AVAILABLE 1
+
+require-env AWS_DEFAULT_REGION
+
+require-env AWS_ACCESS_KEY_ID
+
+require-env AWS_SECRET_ACCESS_KEY
+
+require-env DUCKDB_S3_ENDPOINT
+
+require-env DUCKDB_S3_USE_SSL
+
+# override the default behaviour of skipping HTTP errors and connection failures: this test fails on connection issues
+set ignore_error_messages
+
+statement ok
+CREATE SECRET (
+    TYPE S3,
+    PROVIDER config,
+    KEY_ID '${AWS_ACCESS_KEY_ID}',
+    SECRET '${AWS_SECRET_ACCESS_KEY}',
+    REGION '${AWS_DEFAULT_REGION}',
+    ENDPOINT '${DUCKDB_S3_ENDPOINT}',
+    USE_SSL '${DUCKDB_S3_USE_SSL}',
+    URL_STYLE 'path'
+)
+
+# ATTACH a new writable DuckDB database on S3 with NO_WAL_WRITES to avoid WAL file writes
+# READ_WRITE is required because remote files default to READ_ONLY access mode
+statement ok
+ATTACH 's3://test-bucket/attach_s3_streaming_write.db' AS s3db (RECOVERY_MODE NO_WAL_WRITES, READ_WRITE);
+
+# Create a table and insert data
+statement ok
+CREATE TABLE s3db.test_table AS SELECT i AS id, 'value_' || i::VARCHAR AS name FROM range(1000) t(i);
+
+# Verify the data is queryable
+query I
+SELECT COUNT(*) FROM s3db.test_table;
+----
+1000
+
+query II
+SELECT * FROM s3db.test_table WHERE id = 42;
+----
+42	value_42
+
+# Detach to trigger the final checkpoint/flush to S3
+statement ok
+DETACH s3db;
+
+# Re-attach in read-only mode and verify the data survived the round-trip
+statement ok
+ATTACH 's3://test-bucket/attach_s3_streaming_write.db' AS s3db (READ_ONLY);
+
+query I
+SELECT COUNT(*) FROM s3db.test_table;
+----
+1000
+
+query II
+SELECT MIN(id), MAX(id) FROM s3db.test_table;
+----
+0	999
+
+query II
+SELECT * FROM s3db.test_table WHERE id = 999;
+----
+999	value_999
+
+statement ok
+DETACH s3db;

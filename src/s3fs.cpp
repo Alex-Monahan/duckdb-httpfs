@@ -303,6 +303,7 @@ S3ConfigParams S3ConfigParams::ReadFrom(optional_ptr<FileOpener> opener) {
 void S3FileHandle::Close() {
 	auto &s3fs = (S3FileSystem &)file_system;
 	if (flags.OpenForWriting() && !upload_finalized) {
+		part_0_deferred = false;
 		s3fs.FlushAllBuffers(*this);
 		if (parts_uploaded) {
 			s3fs.FinalizeMultipartUpload(*this);
@@ -428,6 +429,11 @@ void S3FileSystem::FlushBuffer(S3FileHandle &file_handle, shared_ptr<S3WriteBuff
 		return;
 	}
 
+	// Skip Part 0 when deferred (streaming write mode: header written last)
+	if (file_handle.part_0_deferred && write_buffer->part_no == 0) {
+		return;
+	}
+
 	auto uploading = write_buffer->uploading.load();
 	if (uploading) {
 		return;
@@ -473,19 +479,27 @@ void S3FileSystem::FlushBuffer(S3FileHandle &file_handle, shared_ptr<S3WriteBuff
 // Note that FlushAll currently does not allow to continue writing afterwards. Therefore, FinalizeMultipartUpload should
 // be called right after it!
 // TODO: we can fix this by keeping the last partially written buffer in memory and allow reuploading it with new data.
-void S3FileSystem::FlushAllBuffers(S3FileHandle &file_handle) {
+void S3FileSystem::FlushAllBuffers(S3FileHandle &file_handle, bool include_deferred) {
 	//  Collect references to all buffers to check
 	vector<shared_ptr<S3WriteBuffer>> to_flush;
 	file_handle.write_buffers_lock.lock();
 	for (auto &item : file_handle.write_buffers) {
+		// When not including deferred, skip Part 0
+		if (!include_deferred && file_handle.part_0_deferred && item.second->part_no == 0) {
+			continue;
+		}
 		to_flush.push_back(item.second);
 	}
 	file_handle.write_buffers_lock.unlock();
 
+	if (to_flush.empty()) {
+		return;
+	}
+
 	if (file_handle.initialized_multipart_upload == false) {
 		// TODO (carlo): unclear how to handle kms_key_id, but given currently they are custom, leave the multiupload
 		// codepath in that case
-		if (to_flush.size() == 1 && file_handle.auth_params.kms_key_id.empty()) {
+		if (to_flush.size() == 1 && file_handle.auth_params.kms_key_id.empty() && !file_handle.part_0_deferred) {
 			UploadSingleBuffer(file_handle, to_flush[0]);
 			file_handle.upload_finalized = true;
 			return;
@@ -934,6 +948,10 @@ void S3FileHandle::Initialize(optional_ptr<FileOpener> opener) {
 		part_size = ((minimum_part_size + Storage::DEFAULT_BLOCK_SIZE - 1) / Storage::DEFAULT_BLOCK_SIZE) *
 		            Storage::DEFAULT_BLOCK_SIZE;
 		D_ASSERT(part_size * max_part_count >= config_params.max_file_size);
+
+		// Enable streaming write mode: defer Part 0 so it can be uploaded last
+		// This supports DuckDB's checkpoint pattern where the file header is written after all data blocks
+		part_0_deferred = true;
 	}
 }
 
@@ -977,10 +995,25 @@ void S3FileSystem::RemoveDirectory(const string &path, optional_ptr<FileOpener> 
 
 void S3FileSystem::FileSync(FileHandle &handle) {
 	auto &s3fh = handle.Cast<S3FileHandle>();
-	if (!s3fh.upload_finalized) {
+	if (s3fh.upload_finalized) {
+		return;
+	}
+
+	if (s3fh.part_0_deferred) {
+		// Streaming write mode: flush all non-deferred buffers (parts 1..N) but keep Part 0 in memory.
+		// Part 0 contains the file header region and will be uploaded last during Close().
+		// This supports DuckDB's checkpoint pattern: data blocks → Sync → header write → Sync → Close.
+		FlushAllBuffers(s3fh, /*include_deferred=*/false);
+	} else {
+		// Non-streaming path (e.g. COPY TO): flush everything and finalize.
 		FlushAllBuffers(s3fh);
 		FinalizeMultipartUpload(s3fh);
 	}
+}
+
+void S3FileSystem::Truncate(FileHandle &handle, int64_t new_size) {
+	// No-op for S3: object storage does not support truncation.
+	// The final file size is determined by the multipart upload parts.
 }
 
 void S3FileSystem::Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx_t location) {
@@ -993,32 +1026,45 @@ void S3FileSystem::Write(FileHandle &handle, void *buffer, int64_t nr_bytes, idx
 	while (bytes_written < nr_bytes) {
 		auto curr_location = location + bytes_written;
 
-		if (curr_location != s3fh.file_offset) {
-			throw InternalException("Non-sequential write not supported!");
-		}
-
 		// Find buffer for writing
 		auto write_buffer_idx = curr_location / s3fh.part_size;
 
 		// Get write buffer, may block until buffer is available
 		auto write_buffer = s3fh.GetBuffer(write_buffer_idx);
 
+		// Track writes to Part 0's range
+		if (write_buffer_idx == 0) {
+			s3fh.part_0_written = true;
+		}
+
 		// Writing to buffer
 		auto idx_to_write = curr_location - write_buffer->buffer_start;
 		auto bytes_to_write = MinValue<idx_t>(nr_bytes - bytes_written, s3fh.part_size - idx_to_write);
 		memcpy((char *)write_buffer->Ptr() + idx_to_write, (char *)buffer + bytes_written, bytes_to_write);
-		write_buffer->idx += bytes_to_write;
 
-		// Flush to HTTP if full
+		// Update buffer idx to track the highest written position within this buffer
+		auto new_end = idx_to_write + bytes_to_write;
+		if (new_end > write_buffer->idx) {
+			write_buffer->idx = new_end;
+		}
+
+		// Flush to HTTP if full (FlushBuffer will skip Part 0 if deferred)
 		if (write_buffer->idx >= s3fh.part_size) {
 			FlushBuffer(s3fh, write_buffer);
 		}
-		s3fh.file_offset += bytes_to_write;
-		s3fh.length += bytes_to_write;
+
+		// Track file size as the maximum extent written
+		auto write_end = curr_location + bytes_to_write;
+		if (write_end > s3fh.file_offset) {
+			s3fh.file_offset = write_end;
+		}
+		if (write_end > s3fh.length) {
+			s3fh.length = write_end;
+		}
 		bytes_written += bytes_to_write;
 	}
 
-	DUCKDB_LOG_FILE_SYSTEM_WRITE(handle, bytes_written, s3fh.file_offset - bytes_written);
+	DUCKDB_LOG_FILE_SYSTEM_WRITE(handle, bytes_written, location);
 }
 
 static bool Match(vector<string>::const_iterator key, vector<string>::const_iterator key_end,
